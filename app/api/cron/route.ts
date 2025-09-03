@@ -1,51 +1,95 @@
 // app/api/cron/route.ts
 import { put } from '@vercel/blob';
 
-export const runtime = 'nodejs'; // use Node runtime for SDK convenience
+export const runtime = 'nodejs';
 
-function forbidden() {
-  return new Response('Forbidden', { status: 403 });
+// Run only at the chosen Berlin time (00:05)
+const TARGET_HOUR = Number(process.env.CRON_BERLIN_HOUR ?? 0);   // 0 = midnight
+const TARGET_MINUTE = Number(process.env.CRON_BERLIN_MINUTE ?? 5);
+
+function isBerlinTargetTime(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Berlin',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (t: string) => parts.find(p => p.type === t)!.value;
+  return (
+    parseInt(get('hour'), 10) === TARGET_HOUR &&
+    parseInt(get('minute'), 10) === TARGET_MINUTE
+  );
 }
 
+
 export async function GET(req: Request) {
-  // Allow either: Vercel Cron UA or a shared secret header (for manual runs)
+  // Gate: only allow Vercel Cron UA or a shared secret header
   const ua = req.headers.get('user-agent') || '';
   const provided = req.headers.get('x-cron-secret') || '';
   const secret = process.env.CRON_SECRET || '';
-
   if (!(ua.includes('vercel-cron/1.0') || (secret && provided === secret))) {
-    return forbidden();
+    return new Response('Forbidden', { status: 403 });
   }
 
-  const upstreamUrl = process.env.UPSTREAM_API_URL!;
-  const upstreamKey = process.env.UPSTREAM_API_KEY!;
-  if (!upstreamUrl || !upstreamKey) {
-    return new Response('Missing UPSTREAM_API_URL/UPSTREAM_API_KEY', { status: 500 });
+  // Optional Berlin-time guard (only run at the intended local hour)
+  if (!isBerlinTargetTime()) {
+  return new Response('Skip: not 00:05 Berlin', { status: 204 });
   }
 
-  // Adjust the header below to match your upstream’s auth scheme
-  const res = await fetch(upstreamUrl, {
+
+  // ---- Meteonomiqs config ----
+  const apiKey = process.env.MNQ_API_KEY!;
+  const lang = process.env.MNQ_LANG || 'de-de';
+
+  // Choose either coordinates OR by-location (postcode)
+  const lat = process.env.MNQ_LAT;
+  const lon = process.env.MNQ_LON;
+  const country = process.env.MNQ_COUNTRY_CODE; // e.g. "DE"
+  const postcode = process.env.MNQ_POSTCODE;     // e.g. "10115"
+
+  if (!apiKey) return new Response('Missing MNQ_API_KEY', { status: 500 });
+
+  let url: string;
+  if (country && postcode) {
+    // GET /v4_0/forecast/byLocation/{countryCode}/{postCode}
+    url = `https://forecast.meteonomiqs.com/v4_0/forecast/byLocation/${encodeURIComponent(country)}/${encodeURIComponent(postcode)}/`;
+  } else {
+    if (!lat || !lon) {
+      return new Response('Missing MNQ_LAT/MNQ_LON (or set MNQ_COUNTRY_CODE + MNQ_POSTCODE)', { status: 500 });
+    }
+    // GET /v4_0/forecast/{latitude}/{longitude}
+    url = `https://forecast.meteonomiqs.com/v4_0/forecast/${encodeURIComponent(lat)}/${encodeURIComponent(lon)}/`;
+  }
+
+  const res = await fetch(url, {
     headers: {
-      Authorization: `Bearer ${upstreamKey}`,
-      Accept: 'application/json',
+      'x-api-key': apiKey,                 // Meteonomiqs auth
+      'Accept': 'application/json',
+      'Accept-Language': lang,             // e.g. "de-de" or "en-us"
     },
   });
 
   if (!res.ok) {
-    return new Response(`Upstream error: ${res.status}`, { status: 502 });
+    const text = await res.text().catch(() => '');
+    return new Response(`Upstream error ${res.status}: ${text.slice(0, 300)}`, { status: 502 });
   }
 
+  // Wrap with metadata and cache to Blob
   const data = await res.json();
-  const body = JSON.stringify({ fetchedAt: new Date().toISOString(), data });
+  const payload = JSON.stringify({
+    source: 'meteonomiqs_v4',
+    url,
+    fetchedAt: new Date().toISOString(),
+    data,
+  });
 
-  // Store at a stable path. Since May 2025, overwrites require allowOverwrite: true.
-  const blob = await put('cache/latest.json', body, {
+  const blob = await put('cache/latest.json', payload, {
     access: 'public',
     addRandomSuffix: false,
     allowOverwrite: true,
     contentType: 'application/json',
-    cacheControlMaxAge: 60, // at the blob CDN; you can tune this
+    cacheControlMaxAge: 60,
   });
 
-  return Response.json({ ok: true, bytes: body.length, url: blob.url });
+  return Response.json({ ok: true, bytes: payload.length, url: blob.url });
 }
