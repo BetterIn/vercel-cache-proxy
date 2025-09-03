@@ -27,13 +27,15 @@ export async function GET(req: Request) {
   const ua = req.headers.get('user-agent') || '';
   const provided = req.headers.get('x-cron-secret') || '';
   const secret = process.env.CRON_SECRET || '';
+  const { searchParams } = new URL(req.url);
+  const force = searchParams.get('force') === '1';
   if (!(ua.includes('vercel-cron/1.0') || (secret && provided === secret))) {
     return new Response('Forbidden', { status: 403 });
   }
 
   // Optional Berlin-time guard (only run at the intended local hour)
   if (!isBerlinTargetTime()) {
-  return new Response('Skip: not 00:05 Berlin', { status: 204 });
+  return new Response('Skip: not 00:05 Berlin', { status: 200 });
   }
 
 
